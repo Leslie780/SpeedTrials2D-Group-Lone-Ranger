@@ -1,16 +1,37 @@
 import cv2
 import numpy as np
 
+def prepare_frame(frame):
+    """
+    Masks out regions that cause false detections:
+    - Bottom 22% of frame: our own red car body
+    - Top-left HUD corner: colored score numbers (green/red/yellow "0")
+    - Top-right HUD corner: distance counters
+    Returns a copy with masked regions blacked out. Original coordinates are preserved.
+    """
+    masked = frame.copy()
+    h, w = masked.shape[:2]
+    # Black out bottom 22% — our red car body
+    masked[int(h * 0.78):, :] = 0
+    # Black out top-left HUD (score counters with colored text)
+    masked[0:int(h * 0.17), 0:int(w * 0.16)] = 0
+    # Black out top-right HUD (distance counters)
+    masked[0:int(h * 0.14), int(w * 0.77):] = 0
+    return masked
+
 def detect_tokens(frame):
     """
     Converts the BGR frame to HSV, detects Green, Red, and Yellow tokens 
-    with defined HSV thresholds, rejects contours with area < 200 pixels,
+    with defined HSV thresholds, rejects contours with area < 800 pixels,
     and returns a list of dictionaries representing detected tokens sorted by area descending.
     """
     if frame is None:
         return []
 
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    # Mask out car body, HUD, and road edges before detection
+    masked = prepare_frame(frame)
+
+    hsv = cv2.cvtColor(masked, cv2.COLOR_BGR2HSV)
     tokens = []
 
     # HSV thresholds definitions

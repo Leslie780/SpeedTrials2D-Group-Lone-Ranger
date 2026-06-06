@@ -220,4 +220,4 @@ __marimo__/
 **/SpeedTrials2D/
 **/_pycache_pycache_/
 *.pyc
-
+**/frames/
