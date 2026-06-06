@@ -45,20 +45,27 @@ def detect_tokens(frame):
 
     for color_name, mask in color_masks:
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for contour in contours:
-            area = float(cv2.contourArea(contour))
-            if area >= 200:
-                x, y, w, h = cv2.boundingRect(contour)
-                cx = int(x + w // 2)
-                tokens.append({
-                    "color": color_name,
-                    "x": int(x),
-                    "y": int(y),
-                    "w": int(w),
-                    "h": int(h),
-                    "area": area,
-                    "cx": cx
-                })
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < 800:
+                continue
+            x, y, w, h = cv2.boundingRect(c)
+            if w < 20 or h < 20:
+                continue
+            aspect = w / float(h)
+            if aspect > 4.0 or aspect < 0.25:
+                continue
+            
+            cx = int(x + w // 2)
+            tokens.append({
+                "color": color_name,
+                "x": int(x),
+                "y": int(y),
+                "w": int(w),
+                "h": int(h),
+                "area": area,
+                "cx": cx
+            })
 
     # Sort by area descending
     tokens.sort(key=lambda item: item["area"], reverse=True)

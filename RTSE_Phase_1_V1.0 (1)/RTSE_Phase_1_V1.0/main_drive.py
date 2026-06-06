@@ -20,7 +20,7 @@ import time
 import select
 import ctypes
 
-from token_detector import detect_tokens, get_lane, detect_brightness, annotate_frame
+from yolo_detector import detect_tokens, get_lane, detect_brightness, annotate_frame
 
 # Configuration
 CAMERA_HOST = '127.0.0.1'
@@ -37,7 +37,16 @@ shared_data = {
     'lights_on': False,
     'steering': 0.0,
     'acceleration': 1.0,
-    'frame_count': 0
+    'frame_count': 0,
+    # Per-decision cooldown timestamps (time.perf_counter)
+    'last_red_steer_time': 0.0,    # cooldowns: 0.35s (ahead) / 0.25s (side)
+    'last_green_steer_time': 0.0,  # cooldown 0.2s
+    'last_yellow_steer_time': 0.0, # cooldown 0.4s
+    'red_cx_history': [],          # list of last 10 red token cx values
+    'event_trailing_car': False,   # set True when back camera detects approaching car
+    'event_police': False,         # set True externally (future: back camera detection)
+    'event_low_brightness': False, # set True when brightness < 60
+    'frame_save_count': 0,
 }
 data_lock = threading.Lock()
 
@@ -171,78 +180,203 @@ def read_front_camera_task():
 def processing_task():
     with data_lock:
         frame = shared_data.get('latest_front_frame', None)
-    
-    if frame is not None:
-        brightness = detect_brightness(frame)
-        tokens = detect_tokens(frame)
-        
-        with data_lock:
-            shared_data['brightness'] = brightness
-            shared_data['tokens'] = tokens
 
-def tap_steer(value, duration=0.05):
-    with data_lock:
-        shared_data["steering"] = value
-    time.sleep(duration)
-    with data_lock:
-        shared_data["steering"] = 0.0
-
-def decision_task():
-    with data_lock:
-        tokens = shared_data.get('tokens', [])
-        brightness = shared_data.get('brightness', 255.0)
-        frame = shared_data.get('latest_front_frame', None)
-        
+    # FIX Cause 1: explicit None guard before any processing
     if frame is None:
         return
 
-    frame_width = frame.shape[1]
-    
+    with data_lock:
+        count = shared_data['frame_save_count']
+    if count < 500 and count % 10 == 0:  # save every 10th frame = 50 frames total
+        cv2.imwrite(f'frames/frame_{count:04d}.png', frame)
+        with data_lock:
+            shared_data['frame_save_count'] = count + 1
+
+    brightness = detect_brightness(frame)
+    tokens = detect_tokens(frame)
+
+    with data_lock:
+        shared_data['brightness'] = brightness
+        shared_data['tokens'] = tokens
+
+    # FIX Cause 3: save one debug frame to disk so we can inspect actual HSV colors
+    with data_lock:
+        already_saved = shared_data.get('debug_saved', False)
+    if not already_saved:
+        cv2.imwrite('debug_frame.png', frame)
+        with data_lock:
+            shared_data['debug_saved'] = True
+        print('[ProcessingTask] Saved debug_frame.png for HSV inspection')
+
+    back_frame = shared_data.get('latest_back_frame', None)
+    if back_frame is not None:
+        # Detect if a large object (approaching car) fills the bottom center of back frame
+        h, w = back_frame.shape[:2]
+        roi = back_frame[int(h*0.5):, int(w*0.3):int(w*0.7)]  # bottom center ROI
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        mean_val = np.mean(gray)
+        # If bottom center is significantly brighter than background → headlights approaching
+        if mean_val > 180:
+            with data_lock:
+                shared_data['event_trailing_car'] = True
+
+# tap_steer: fires a timed steering pulse in a background daemon thread.
+# duration=0.12s gives ~24 send-cycles at 200Hz — long enough for simulator to register.
+# Caller is responsible for recording the timestamp in shared_data after calling this.
+def tap_steer(value, duration=0.12):
+    def _do_tap():
+        with data_lock:
+            shared_data["steering"] = value
+        time.sleep(duration)
+        with data_lock:
+            shared_data["steering"] = 0.0
+    t = threading.Thread(target=_do_tap, daemon=True)
+    t.start()
+
+def decision_task():
+    """
+    8-level strict priority decision engine based purely on pixel position (cx).
+    """
+    now = time.perf_counter()
+
+    # Read all shared state under a single lock acquisition
+    with data_lock:
+        tokens         = shared_data.get('tokens', [])
+        brightness     = shared_data.get('brightness', 255.0)
+        frame          = shared_data.get('latest_front_frame', None)
+        t_red          = shared_data.get('last_red_steer_time', 0.0)
+        t_green        = shared_data.get('last_green_steer_time', 0.0)
+        t_yellow       = shared_data.get('last_yellow_steer_time', 0.0)
+
+    if frame is None:
+        return
+
+    frame_width  = frame.shape[1]
+    frame_height = frame.shape[0]
+
+    # PROXIMITY FILTER: ignore tokens whose top edge is in the top 40% of frame.
+    tokens = [t for t in tokens if t['y'] > frame_height * 0.4]
+
+    # --- Token selection: largest area first (detect_tokens already sorts this way) ---
+    red_token    = next((t for t in tokens if t['color'] == 'red'),    None)
+    green_token  = next((t for t in tokens if t['color'] == 'green'),  None)
+    yellow_token = next((t for t in tokens if t['color'] == 'yellow'), None)
+
+    if red_token:
+        with data_lock:
+            history = shared_data['red_cx_history']
+            history.append(red_token['cx'])
+            if len(history) > 10:
+                history.pop(0)
+            shared_data['red_cx_history'] = history
+        if len(history) == 10 and (max(history) - min(history)) < 5:
+            red_token = None
+            print("[DECISION] Phantom red suppressed")
+    else:
+        with data_lock:
+            shared_data['red_cx_history'] = []
+
+    # EVENT: Low Brightness — log it (light-on command is a future enhancement)
     if brightness < 60.0:
         with data_lock:
-            shared_data["lights_on"] = True
-            
-    # Default: go straight, full speed
-    target_steering = 0.0
+            shared_data['lights_on'] = True
+            shared_data['event_low_brightness'] = True
+        print("[EVENT] Low brightness detected")
+
+    # EVENT: Trailing Car — if back camera shows a car close behind, switch lanes
+    with data_lock:
+        trailing = shared_data.get('event_trailing_car', False)
+    if trailing:
+        print("[EVENT] Trailing car — switching lane")
+        tap_steer(1.0, duration=0.15)
+        with data_lock:
+            shared_data['event_trailing_car'] = False
+            shared_data['last_red_steer_time'] = time.perf_counter()
+        return  # skip normal token logic this cycle
+
+    target_steering    = 0.0
     target_acceleration = 1.0
-    action_decided = False
-    
-    red_token = next((t for t in tokens if t['color'] == 'red'), None)
-    yellow_token = next((t for t in tokens if t['color'] == 'yellow'), None)
-    green_token = next((t for t in tokens if t['color'] == 'green'), None)
-    
-    # Red token avoidance
-    if red_token:
-        lane = get_lane(red_token['cx'], frame_width)
-        if lane == 1:
-            target_steering = -0.6 if red_token['cx'] > frame_width / 2 else 0.6
-            action_decided = True
+    steer_taken        = None   # 'red' | 'green' | 'yellow' | None
+    color_printed      = None
+    cx_printed         = None
 
-    # Yellow token caution
-    if not action_decided and yellow_token:
-        target_acceleration = 0.8
-        target_steering = -0.4 if yellow_token['cx'] > frame_width / 2 else 0.4
-        action_decided = True
+    # 1. Red token DIRECTLY AHEAD (cx 213-426)
+    if red_token and 213 <= red_token['cx'] <= 426 and (now - t_red) >= 0.35:
+        steer = 1.0 if red_token['cx'] < 320 else -1.0
+        target_steering = steer
+        steer_taken = 'red'
+        color_printed = 'red'
+        cx_printed = red_token['cx']
 
-    # Green token chasing
-    if not action_decided and green_token:
-        lane = get_lane(green_token['cx'], frame_width)
-        if lane == 1:
-            target_acceleration = 1.0
-            target_steering = 0.0
-        elif lane == 0:
-            target_steering = -0.6
-        elif lane == 2:
-            target_steering = 0.6
-        action_decided = True
+    # 2. Red token to the LEFT (cx < 213)
+    elif red_token and red_token['cx'] < 213 and red_token['y'] > frame_height * 0.5 and (now - t_red) >= 0.25:
+        steer = 0.7
+        target_steering = steer
+        steer_taken = 'red'
+        color_printed = 'red'
+        cx_printed = red_token['cx']
 
-    # Update state
+    # 3. Red token to the RIGHT (cx > 426)
+    elif red_token and red_token['cx'] > 426 and red_token['y'] > frame_height * 0.5 and (now - t_red) >= 0.25:
+        steer = -0.7
+        target_steering = steer
+        steer_taken = 'red'
+        color_printed = 'red'
+        cx_printed = red_token['cx']
+
+    # 4. Green token to the LEFT (cx < 213)
+    elif green_token and green_token['cx'] < 213 and (now - t_green) >= 0.2:
+        steer = -0.7
+        target_steering = steer
+        steer_taken = 'green'
+        color_printed = 'green'
+        cx_printed = green_token['cx']
+
+    # 5. Green token to the RIGHT (cx > 426)
+    elif green_token and green_token['cx'] > 426 and (now - t_green) >= 0.2:
+        steer = 0.7
+        target_steering = steer
+        steer_taken = 'green'
+        color_printed = 'green'
+        cx_printed = green_token['cx']
+
+    # 6. Green DIRECTLY AHEAD
+    elif green_token and 213 <= green_token['cx'] <= 426:
+        # stay straight, no steer
+        pass
+
+    # 7. Yellow DIRECTLY AHEAD
+    elif yellow_token and 213 <= yellow_token['cx'] <= 426 and (now - t_yellow) >= 0.4:
+        steer = 0.6 if yellow_token['cx'] < 320 else -0.6
+        target_steering = steer
+        steer_taken = 'yellow'
+        color_printed = 'yellow'
+        cx_printed = yellow_token['cx']
+
+    # 8. Default -> straight, acceleration 1.0
+    else:
+        target_steering = 0.0
+        target_acceleration = 1.0
+
+    if steer_taken is not None:
+        print(f"[DECISION] {color_printed} cx={cx_printed} → steer={target_steering:.1f}")
+
+    # --- Commit acceleration ---
     with data_lock:
         shared_data['acceleration'] = target_acceleration
 
-    # Apply tap steering logic if we have an active steer command
-    if target_steering != 0.0:
-        tap_steer(target_steering)
+    # --- Fire steering tap and update cooldown state ---
+    if target_steering != 0.0 and steer_taken is not None:
+        tap_steer(target_steering, duration=0.12)
+        ts = time.perf_counter()
+        with data_lock:
+            # Record per-color timestamp
+            if steer_taken == 'red':
+                shared_data['last_red_steer_time'] = ts
+            elif steer_taken == 'green':
+                shared_data['last_green_steer_time'] = ts
+            elif steer_taken == 'yellow':
+                shared_data['last_yellow_steer_time'] = ts
     else:
         with data_lock:
             shared_data['steering'] = 0.0
@@ -278,12 +412,16 @@ def monitor_task():
 if __name__ == '__main__':
     print("Initializing RTOS Multi-Threaded Driving Agent...")
     
+    import os
+    os.makedirs('frames', exist_ok=True)
+
     threading.Thread(target=setup_control_server, daemon=True).start()
     threading.Thread(target=setup_cameras, daemon=True).start()
     
     t_front_camera = RTTask("ReadFrontCamera", period=0.005, priority=TaskPriority.HIGH, execute_func=read_front_camera_task)
     t_processing = RTTask("ProcessingTask", period=0.005, priority=TaskPriority.MEDIUM, execute_func=processing_task)
-    t_decision = RTTask("DecisionTask", period=0.010, priority=TaskPriority.MEDIUM, execute_func=decision_task)
+    # FIX Cause 4: period reduced from 0.010s → 0.005s to match ProcessingTask cadence
+    t_decision = RTTask("DecisionTask", period=0.005, priority=TaskPriority.MEDIUM, execute_func=decision_task)
     t_controls = RTTask("SendControlsTask", period=0.005, priority=TaskPriority.HIGH, execute_func=send_controls_task)
     t_monitor = RTTask("MonitorTask", period=0.5, priority=TaskPriority.LOW, execute_func=monitor_task)
     
