@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+**/SpeedTrials2D/
+**/_pycache_pycache_/
+*.pyc
+
